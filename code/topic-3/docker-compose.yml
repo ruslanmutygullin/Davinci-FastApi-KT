@@ -1,0 +1,27 @@
+# Optional: run the API against Postgres instead of SQLite.
+# You do NOT need this to run or test the app — SQLite works with zero setup.
+# It demonstrates that switching databases is a config change, not a code change.
+#
+#   docker compose up
+#
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: notes
+      POSTGRES_PASSWORD: notes
+      POSTGRES_DB: notes
+    ports:
+      - "5432:5432"
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # The app switches to Postgres purely via this env var (see app/config.py).
+      # NOTE: using Postgres for real also needs a driver, e.g. add psycopg2-binary
+      # to requirements.txt.
+      DATABASE_URL: postgresql://notes:notes@db:5432/notes
+    depends_on:
+      - db

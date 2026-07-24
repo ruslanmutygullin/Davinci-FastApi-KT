@@ -1,0 +1,7 @@
+# Runtime deps for the Dockerfile in this folder (mirrors ../requirements.txt).
+# For local dev you can just use ../requirements.txt instead.
+fastapi[standard]>=0.115
+uvicorn>=0.30
+sqlmodel>=0.0.24
+pydantic-settings>=2.5
+pyjwt>=2.9
