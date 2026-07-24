@@ -2,4 +2,19 @@
 name = "davinci-fastapi-kt"
 version = "0.1.0"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "fastapi[standard]>=0.115",
+    "uvicorn>=0.30",
+    "sqlmodel>=0.0.24",
+    "pydantic-settings>=2.5",
+    "pyjwt>=2.9",
+    "pytest>=8.0",
+    "httpx>=0.27",
+]
+
+[tool.pytest.ini_options]
+# Each topic/exercise is its own self-contained app that imports a local `app`/`main`
+# module, so run tests from inside a topic or exercise folder, e.g.:
+#   cd code/topic-1 && pytest
+# This section just keeps output consistent when you do.
+addopts = "-q"
