@@ -1,6 +1,6 @@
-"""Exercise 5 — request data beyond JSON.
+"""Exercise 4 — request data beyond JSON.
 
-GOAL: implement two endpoints (see test_ex5.py for the exact spec):
+GOAL: implement two endpoints (see test_ex4.py for the exact spec):
 
   1. POST /contact  — a FORM endpoint taking `name` and `email` form fields, returning
      {"name": ..., "email": ...}.

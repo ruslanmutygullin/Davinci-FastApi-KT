@@ -1,4 +1,4 @@
-"""Spec for Exercise 5. FAIL against the starter, PASS once you add both endpoints."""
+"""Exercise 4 spec — passes against the solution."""
 
 import io
 
@@ -16,7 +16,6 @@ def test_contact_form():
 
 
 def test_contact_requires_both_fields():
-    # email missing -> 422
     assert client.post("/contact", data={"name": "Grace"}).status_code == 422
 
 
@@ -26,4 +25,4 @@ def test_avatar_upload():
     assert r.status_code == 200
     body = r.json()
     assert body["filename"] == "me.png"
-    assert body["size"] == 28  # 8-byte PNG header + 20 'x'
+    assert body["size"] == 28
