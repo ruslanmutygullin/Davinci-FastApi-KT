@@ -7,10 +7,21 @@ from sqlmodel import SQLModel
 
 
 class NoteCreate(SQLModel):
-    """What a client sends — no id (the DB assigns it)."""
+    """What a client sends on create (and full-replace PUT) — no id (the DB assigns it)."""
 
     title: str
     done: bool = False
+
+
+class NoteUpdate(SQLModel):
+    """Partial update (PATCH) — every field optional so clients send only what changes.
+
+    Combined with model_dump(exclude_unset=True) in the handler, an omitted field is left
+    untouched rather than reset to a default.
+    """
+
+    title: str | None = None
+    done: bool | None = None
 
 
 class NoteRead(SQLModel):

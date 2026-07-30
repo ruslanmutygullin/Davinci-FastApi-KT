@@ -30,6 +30,15 @@ def test_update(client):
     assert r.json() == {"id": nid, "title": "new", "done": True}
 
 
+def test_patch_only_changes_sent_fields(client):
+    nid = client.post("/notes", json={"title": "keep me", "done": True}).json()["id"]
+
+    # Send only `done` — `title` must be left untouched (that's the point of PATCH).
+    r = client.patch(f"/notes/{nid}", json={"done": False})
+    assert r.status_code == 200
+    assert r.json() == {"id": nid, "title": "keep me", "done": False}
+
+
 def test_delete_requires_api_key(client):
     nid = client.post("/notes", json={"title": "to delete"}).json()["id"]
 

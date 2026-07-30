@@ -11,7 +11,7 @@ from sqlmodel import Session, select
 
 from app.database import get_session
 from app.models import Note
-from app.schemas import NoteCreate, NoteRead
+from app.schemas import NoteCreate, NoteRead, NoteUpdate
 
 router = APIRouter(prefix="/notes", tags=["notes"])
 
@@ -64,6 +64,29 @@ async def update_note(
         raise HTTPException(status_code=404, detail="Note not found")
     note.title = payload.title
     note.done = payload.done
+    session.add(note)
+    session.commit()
+    session.refresh(note)
+    return note
+
+
+@router.patch("/{note_id}", response_model=NoteRead)
+async def patch_note(
+    note_id: int,
+    payload: NoteUpdate,
+    session: Annotated[Session, Depends(get_session)],
+):
+    """Partial update: apply only the fields the client actually sent.
+
+    exclude_unset=True is the crux — it distinguishes an omitted field from one explicitly
+    set, so we never overwrite data the client didn't touch (contrast the PUT above, which
+    replaces every field).
+    """
+    note = session.get(Note, note_id)
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        setattr(note, key, value)
     session.add(note)
     session.commit()
     session.refresh(note)

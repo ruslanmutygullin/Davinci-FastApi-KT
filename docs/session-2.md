@@ -106,6 +106,29 @@ class Note(SQLModel, table=True):
 default of `None` because the *database* assigns it on insert — before insertion, a new
 `Note` has no id. This is your Prisma schema model, but expressed as a Python class.
 
+> **"Isn't there a more modern way?"** You'll see three syntaxes in the wild, and it helps
+> to know how they relate:
+>
+> ```python
+> # 1. SQLAlchemy 1.x "classic" — legacy, and untyped (your IDE sees a Column, not a str):
+> title = Column(String, nullable=False)
+>
+> # 2. SQLAlchemy 2.0 "modern" — Mapped[] + mapped_column(), the current idiomatic style.
+> #    The annotation drives both the type checker AND the column (nullability comes from
+> #    Mapped[str] vs Mapped[str | None]):
+> title: Mapped[str] = mapped_column()
+>
+> # 3. SQLModel Field() — what this course uses:
+> title: str
+> ```
+>
+> These aren't old-vs-new alternatives to each other. **SQLModel is built *on top of*
+> SQLAlchemy 2.0's typed-mapping machinery** (option 2) and fuses it with Pydantic — which
+> is precisely why one class can be both a table and an API schema. For a FastAPI app it's
+> the most modern choice, not a dated one. If you ever drop down to plain SQLAlchemy (no
+> FastAPI), you'll write option 2 directly; SQLModel's `Field` is the FastAPI-native
+> equivalent sitting one layer up — much like Prisma sits above a lower-level driver.
+
 ### The session — a unit of work
 
 ```python
@@ -129,10 +152,69 @@ The lifecycle of an insert:
 3. `session.refresh(note)` — re-reads the row so `note.id` (assigned by the DB) is
    populated on your in-memory object.
 
+On **updates**, you'll see `session.add(note)` called on an object you fetched — that's
+conventional but not strictly required. SQLAlchemy already tracks the object from the
+moment `session.get()` returned it, so any attribute mutation is detected automatically.
+The `commit()` flushes it either way.
+
+**What if `commit()` fails?** The transaction rolls back automatically. Our `get_session`
+dependency wraps the session in a `with` block, and when an exception propagates out of the
+handler, exiting that block rolls back any uncommitted work — you never see a half-applied
+write. This is the ORM equivalent of a `try/finally` around a `BEGIN`/`ROLLBACK`, and it's
+another thing the `with`-based session (and the `yield` teardown that mirrors it) gives you
+for free.
+
 **Why one session per request?** Because a session holds transaction state. Sharing one
 across requests would mix unrelated work into one transaction and create race conditions.
 This "one session per request" rule is *exactly* the problem dependency injection solves
 next.
+
+### Relationships, and two traps with no Prisma equivalent
+
+Real models have relationships. SQLModel expresses them with a foreign-key `Field` plus a
+`Relationship()` attribute:
+
+```python
+from sqlmodel import Relationship
+
+
+class User(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    name: str
+    notes: list["Note"] = Relationship(back_populates="owner")
+
+
+class Note(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    title: str
+    owner_id: int | None = Field(default=None, foreign_key="user.id")
+    owner: User | None = Relationship(back_populates="notes")
+```
+
+`Field(foreign_key="user.id")` is the actual column; `Relationship()` is the convenience
+attribute that lets you write `note.owner` instead of a manual join. `back_populates` keeps
+both sides in sync.
+
+Two things bite JS developers here, because Prisma hides both:
+
+**1. Lazy loading and the N+1 problem.** `note.owner` isn't loaded with the note — it fires
+a *separate* query the moment you access it. In a loop this is catastrophic: listing 100
+notes and reading `note.owner.name` on each emits 1 + 100 queries. Prisma forces you to be
+explicit with `include: { owner: true }`; SQLAlchemy loads lazily by default, so the query
+is invisible until you profile it. The fix is eager loading — `select(Note).options(
+selectinload(Note.owner))` — which fetches the related rows in one extra query.
+
+**2. `DetachedInstanceError` after the session closes.** Because our `get_session`
+dependency closes the session when the response is built, accessing a lazy relationship
+*after* that — for example inside `response_model` serialization of a not-yet-loaded
+attribute — raises `DetachedInstanceError`. The object is now detached from any session and
+can't run the query it needs. This is the single most common "it worked in a script but
+breaks in the endpoint" bug. The fix is the same: load what you'll serialize *before* the
+session closes (eager loading, or access the attribute inside the handler).
+
+Both traps come from the same root: **the session is what makes lazy attributes work, and
+the session is per-request.** Keep the "load inside the request, while the session is open"
+rule in mind and both disappear.
 
 ---
 
@@ -171,6 +253,11 @@ def get_session():
 async def list_notes(session: Session = Depends(get_session)):
     return session.exec(select(Note)).all()
 ```
+
+> **`Annotated` syntax.** You'll also see this written as
+> `session: Annotated[Session, Depends(get_session)]` — that's the newer, preferred style
+> and what the `code/topic-2/` examples use. The two forms are exactly equivalent; FastAPI
+> accepts both.
 
 Here is the exact sequence FastAPI performs for each request to `/notes`:
 
@@ -289,6 +376,49 @@ concrete illustration of the layering from Topic 1: **parameter validation happe
 your dependency body executes.** Making the parameter optional hands you control of the
 status code.
 
+### Testing: `dependency_overrides`
+
+The real payoff of DI over middleware is testability. Because each dependency is a
+named function, you can swap it out at test time **without changing any app code**:
+
+```python
+# tests/conftest.py
+from fastapi.testclient import TestClient
+from sqlmodel import SQLModel, Session, create_engine
+from sqlmodel.pool import StaticPool
+
+from app.main import app
+from app.database import get_session
+
+
+@pytest.fixture(name="client")
+def client_fixture():
+    # Fresh in-memory database — isolated per test, nothing written to disk.
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+
+    def get_session_override():
+        with Session(engine) as session:
+            yield session
+
+    app.dependency_overrides[get_session] = get_session_override  # ← the swap
+    yield TestClient(app)
+    app.dependency_overrides.clear()  # reset so tests don't bleed into each other
+```
+
+`app.dependency_overrides` is a plain dict: key is the original dependency function,
+value is the replacement. FastAPI checks this dict when resolving the graph — if a
+match is found, it calls the override instead. The rest of the app is completely
+unaware. This is what "testable by design" actually means in practice.
+
+Compare the Express equivalent: you'd have to monkeypatch `req.db` in middleware,
+mock out the module that creates the connection, or wrap your app factory to accept
+configuration. Here you replace one key in a dict.
+
 ---
 
 ## 4. Startup and shutdown: the lifespan
@@ -335,6 +465,47 @@ or add an internal field **without changing what clients send or receive**. The 
 contract and the storage schema evolve independently. This is the structural reason FastAPI
 apps stay maintainable as they grow, and it's why `response_model` (Topic 1) matters.
 
+### A fourth schema: `NoteUpdate` for partial updates (PATCH)
+
+`NoteCreate` doubles as the PUT body, which models a *full replacement* — the client must
+send every field. But often you want to change one field and leave the rest alone. That's
+`PATCH`, and it needs its own schema where **every field is optional**:
+
+```python
+class NoteUpdate(SQLModel):
+    title: str | None = None
+    done: bool | None = None
+```
+
+The handler then applies only the fields the client actually sent, using
+`exclude_unset=True` to tell the difference between "field omitted" and "field explicitly
+set to null":
+
+```python
+@router.patch("/{note_id}", response_model=NoteRead)
+async def patch_note(
+    note_id: int,
+    payload: NoteUpdate,
+    session: Annotated[Session, Depends(get_session)],
+):
+    note = session.get(Note, note_id)
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    # Only overwrite the fields the client sent.
+    updates = payload.model_dump(exclude_unset=True)
+    for key, value in updates.items():
+        setattr(note, key, value)
+    session.add(note)
+    session.commit()
+    session.refresh(note)
+    return note
+```
+
+`exclude_unset=True` is the crux: without it, the omitted fields come back as their
+defaults (`None`) and you'd wipe data the client never meant to touch. This is a fourth
+distinct shape — create, read, full-replace, partial-update — and it's exactly why keeping
+schemas separate from the table model pays off.
+
 ---
 
 ## Key takeaways
@@ -346,6 +517,7 @@ apps stay maintainable as they grow, and it's why `response_model` (Topic 1) mat
 3. **`Depends` computes and injects values**, resolving a cached graph per request, with
    `yield` providing automatic teardown. It's injection, not middleware mutation.
 4. **Dependencies double as guards** and are the home of auth.
+   `dependency_overrides` makes them trivially replaceable in tests.
 5. **`lifespan` is startup/shutdown** at app scope — the same `yield` pattern, one level up.
 6. **Separate storage models from API schemas** so the two can evolve independently.
 
