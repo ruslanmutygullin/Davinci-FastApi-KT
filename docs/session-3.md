@@ -1,83 +1,401 @@
-# Topic 3 — Configuration, Errors, Testing & Deployment
+# Topic 3 — Production Patterns: Services, Migrations, Validators & Testing
 
-This topic covers the concerns that separate a demo from a maintainable service:
-**configuration** that's validated and environment-aware, **error handling** that's
-consistent, **testing** that's fast and isolated, and **containerization** for reproducible
-deployment. The testing section is the conceptual heart — it's where the dependency
-injection from Topic 2 pays off.
+This topic bridges the gap between a working demo and a maintainable production service.
+The notes app from Topic 2 gets a service layer, schema validators, Alembic migrations, and
+a full test suite. Each addition mirrors a pattern from the real codebase.
 
-> ▶ **Run the code:** [`code/topic-3/`](../code/topic-3/) is the production-ready app for
-> this topic (config, JWT auth, CORS, tests, Docker). Practice:
-> [`exercises/ex3_health_and_update`](../exercises/ex3_health_and_update/).
+> ▶ **Run the code:** [`code/topic-3/`](../code/topic-3/) — Practice:
+> [`exercises/ex3_service_and_validators`](../exercises/ex3_service_and_validators/) ·
+> [`exercises/ex5_mocking_parametrize`](../exercises/ex5_mocking_parametrize/)
+
+```
+app/
+├── main.py           # CORS, exception handler, lifespan
+├── config.py         # pydantic-settings
+├── database.py       # engine + init_db
+├── dependencies.py   # SessionDep, CurrentUserDep, require_api_key
+├── models.py         # Note table
+├── schemas.py        # NoteCreate, NoteUpdate (with validators), NoteRead
+├── errors.py         # NoteNotFoundError
+├── auth.py           # JWT: get_current_user, create_access_token
+├── services/
+│   └── notes.py      # NoteService — all business logic lives here
+└── routers/
+    └── notes.py      # thin HTTP layer — calls service, returns result
+alembic/
+├── env.py
+└── versions/
+    ├── 0001_initial.py
+    └── 0002_add_owner.py
+tests/
+├── conftest.py
+├── test_notes_router.py   # TestClient — HTTP contract tests
+├── test_notes_service.py  # direct service calls — logic tests
+└── test_schemas.py        # parametrize — validator tests
+```
 
 ---
 
 ## 1. Configuration as validated data
 
-Hardcoded values (a database URL, an API key) are fine on your laptop and dangerous in
-production, for the obvious reason that different environments need different values and
-secrets must not live in source. In Node you reach for `dotenv` to load a `.env` file, and
-perhaps a Zod schema to validate the result.
-
-`pydantic-settings` does both at once, reusing the same validation engine as your request
-models:
-
 ```python
+# app/config.py
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
 
 class Settings(BaseSettings):
     database_url: str = "sqlite:///./notes.db"
-    api_key: str
-    debug: bool = False
+    api_key: str = "secret123"
+    jwt_secret: str = "change-me-in-production-this-is-only-a-demo-secret"
+    cors_origins: list[str] = ["http://localhost:5173"]
+    webhook_url: str = ""
 
     model_config = SettingsConfigDict(env_file=".env")
-
 
 settings = Settings()
 ```
 
-What happens when `Settings()` is constructed:
+When `Settings()` constructs it reads environment variables first (case-insensitive:
+`DATABASE_URL` → `database_url`), then `.env`, then field defaults. A field with no default
+is **required** — the app refuses to start with a clear error rather than failing
+mysteriously at request time.
 
-1. For each field, it looks for a matching **environment variable** (case-insensitive:
-   `database_url` ← `DATABASE_URL`).
-2. If not found in the environment, it falls back to the `.env` file, then to the field's
-   default.
-3. It **validates and coerces** each value with Pydantic. `debug` reads the string
-   `"true"` from the environment and produces the bool `True`. `api_key` has no default, so
-   if it's missing the app **refuses to start** with a clear error.
-
-That last point is the key idea: **misconfiguration fails loudly at startup, not
-mysteriously at request time.** A missing secret is caught the moment the process boots,
-not three hours later when the first request that needs it arrives. This is the same
-"validate at the boundary" philosophy as request validation, applied to config.
-
-**Operational note:** never commit `.env`. Add it to `.gitignore` and commit a
-`.env.example` with dummy values so the required keys are documented. Because `Settings`
-reads the real environment first, production can inject values via the platform (container
-env vars, a secrets manager) with no file at all — and no code change.
+- Never commit `.env`. Commit `.env.example` with dummy values.
+- In production, inject real values as platform env vars — no file needed.
+- `cors_origins: list[str]` reads `CORS_ORIGINS=http://a.com,http://b.com` as a list automatically.
 
 ---
 
-## 2. Error handling: from ad-hoc to centralized
+## 2. The service layer
 
-Topic 1 covered `raise HTTPException(status_code=404, detail="...")`. That's the right tool
-for one-off errors. But as an app grows you want *domain* errors — meaningful exception
-types — and one place that decides how each maps to an HTTP response. This is the analogue
-of a global error-handling middleware in Express or an exception filter in Nest.
+### Why
 
-FastAPI lets you register a handler for any exception type:
+The Topic 2 router handled everything: DB queries, validation, error raising. That works
+for a tutorial. It becomes a problem when you need the same logic from two endpoints, or
+want to test logic without spinning up HTTP, or the function grows complex enough to deserve
+its own test file.
+
+The fix is a **service layer** — a plain Python module between the router and the database.
+
+```
+routers/notes.py    ← HTTP: params, status codes, response_model
+services/notes.py   ← logic: queries, validation, side effects
+models / database   ← storage
+```
+
+### The service
 
 ```python
-from fastapi import Request
-from fastapi.responses import JSONResponse
+# app/services/notes.py
+import httpx
+from sqlmodel import Session, select
+
+from app.config import settings
+from app.errors import NoteNotFoundError
+from app.models import Note
+from app.schemas import NoteCreate, NoteUpdate
 
 
+def _notify(note: Note) -> None:
+    """Best-effort webhook — failures are swallowed, never break the request."""
+    if not settings.webhook_url:
+        return
+    try:
+        httpx.post(settings.webhook_url, json={"id": note.id, "title": note.title}, timeout=5)
+    except Exception:
+        pass
+
+
+class NoteService:
+    def get(self, db: Session, note_id: int) -> Note:
+        note = db.get(Note, note_id)
+        if not note:
+            raise NoteNotFoundError(note_id)   # domain exception, not HTTPException
+        return note
+
+    def create(self, db: Session, payload: NoteCreate) -> Note:
+        note = Note(title=payload.title, done=payload.done)
+        db.add(note)
+        db.commit()
+        db.refresh(note)
+        _notify(note)   # external side effect — easy to mock in tests
+        return note
+
+    def patch(self, db: Session, note_id: int, payload: NoteUpdate) -> Note:
+        note = self.get(db, note_id)
+        for key, value in payload.model_dump(exclude_unset=True).items():
+            setattr(note, key, value)
+        db.add(note)
+        db.commit()
+        db.refresh(note)
+        return note
+
+    # get_all, update, delete follow the same shape
+
+note_service = NoteService()   # stateless singleton
+```
+
+The service has **no FastAPI imports**. It raises `NoteNotFoundError` — a domain exception
+that `main.py`'s exception handler converts to HTTP. The service can be called from tests,
+CLI scripts, background tasks, or other services without any HTTP machinery.
+
+### The router
+
+```python
+# app/routers/notes.py
+from app.dependencies import CurrentUserDep, SessionDep, require_api_key
+from app.schemas import NoteCreate, NoteRead, NoteUpdate
+from app.services.notes import note_service
+
+router = APIRouter(tags=["notes"])
+
+
+@router.post("/notes", response_model=NoteRead, status_code=201)
+async def create_note(payload: NoteCreate, session: SessionDep, current_user: CurrentUserDep):
+    return note_service.create(session, payload)
+
+
+@router.patch("/notes/{note_id}", response_model=NoteRead)
+async def patch_note(note_id: int, payload: NoteUpdate, session: SessionDep, current_user: CurrentUserDep):
+    return note_service.patch(session, note_id, payload)
+
+
+@router.delete("/notes/{note_id}", status_code=204, dependencies=[Depends(require_api_key)])
+async def delete_note(note_id: int, session: SessionDep):
+    note_service.delete(session, note_id)
+```
+
+Three lines per handler: declare what you need, call the service, return. No logic.
+
+### Side effects in the service
+
+`_notify()` above is the mocking teaching vehicle, but the pattern is real: UCM's
+`services/usecase.py` calls `coveo_service.sync(...)` after every DB commit, wrapped in
+`try/except` so a Coveo failure never rolls back a successful DB write. Keeping side effects
+in the service (not the router) means they can be mocked without touching HTTP machinery.
+
+---
+
+## 3. Pydantic v2 validators
+
+Pydantic v2 lets you add custom validation logic directly on schemas. This is how both
+services enforce business rules — rejected at the schema boundary, before data reaches the
+service.
+
+### `@field_validator` — single-field validation and transformation
+
+```python
+# app/schemas.py
+from pydantic import ConfigDict, field_validator, model_validator
+from sqlmodel import SQLModel
+
+
+class NoteCreate(SQLModel):
+    title: str
+    done: bool = False
+
+    @field_validator("title")
+    @classmethod
+    def title_must_not_be_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("title must not be blank")
+        return v.strip()   # return value replaces the field — "  hello  " → "hello"
+```
+
+A `ValueError` inside a validator becomes a `422` response with the field name in
+`detail[].loc`. The return value **replaces** the input, so validators can transform as
+well as reject. Both happen here: blank titles are rejected and valid ones are stripped.
+
+### `extra="forbid"` — reject unknown fields
+
+By default Pydantic ignores extra fields. On an update schema a typo like `"titl"` silently
+does nothing. `extra="forbid"` turns it into a 422:
+
+```python
+class NoteUpdate(SQLModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = None
+    done: bool | None = None
+```
+
+`PATCH /notes/1` with `{"titl": "typo"}` now returns:
+```json
+{"detail": [{"loc": ["body", "titl"], "msg": "Extra inputs are not permitted"}]}
+```
+
+### `@model_validator` — cross-field validation
+
+When the rule spans multiple fields, `@model_validator(mode="after")` runs on the
+fully-constructed object:
+
+```python
+class NoteUpdate(SQLModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str | None = None
+    done: bool | None = None
+
+    @model_validator(mode="after")
+    def at_least_one_field(self) -> "NoteUpdate":
+        if self.title is None and self.done is None:
+            raise ValueError("provide at least one field to update")
+        return self
+```
+
+`PATCH /notes/1` with `{}` now returns 422 instead of silently doing nothing.
+
+### `model_dump(exclude_unset=True)`
+
+The PATCH companion — distinguishes "field omitted" from "field set to null":
+
+```python
+# in NoteService.patch
+for key, value in payload.model_dump(exclude_unset=True).items():
+    setattr(note, key, value)
+```
+
+`PATCH {"done": true}` updates only `done`. Without `exclude_unset=True` the `None`
+default for `title` would overwrite the existing value.
+
+---
+
+## 4. Alembic migrations
+
+### Why `create_all()` is dev-only
+
+`SQLModel.metadata.create_all(engine)` creates tables that don't exist. It **never alters
+existing tables**. Add a column to `Note`, restart the app — `create_all` sees the table
+exists and skips it. The column is silently absent in production.
+
+**Alembic** is your `prisma migrate` — versioned SQL scripts that apply changes
+incrementally and track which ones have run.
+
+### Setup
+
+```bash
+pip install alembic
+alembic init alembic
+```
+
+Configure `alembic/env.py` to read the DB URL from settings and target `SQLModel.metadata`:
+
+```python
+# alembic/env.py
+from sqlmodel import SQLModel
+import app.models   # registers models with SQLModel.metadata
+
+target_metadata = SQLModel.metadata
+
+def get_url() -> str:
+    from app.config import settings
+    return settings.database_url
+```
+
+### The workflow
+
+```bash
+# 1. Change your model — e.g. add `owner: str | None = None` to Note
+# 2. Generate a migration
+alembic revision --autogenerate -m "add owner to note"
+# 3. Review alembic/versions/0002_add_owner.py — always check autogenerated output
+# 4. Apply
+alembic upgrade head
+# Roll back one step
+alembic downgrade -1
+```
+
+The generated file for the `owner` column:
+
+```python
+# alembic/versions/0002_add_owner.py
+revision: str = "0002"
+down_revision: Union[str, None] = "0001"   # linked list of migrations
+
+def upgrade() -> None:
+    op.add_column("note", sa.Column("owner", sa.String(), nullable=True))
+
+def downgrade() -> None:
+    op.drop_column("note", "owner")
+```
+
+Each file has a `revision` id and `down_revision` pointer forming a chain. `alembic upgrade
+head` walks the chain and applies any unapplied migrations.
+
+> UCM has 17 migration files in `alembic/versions/` — every schema change since the initial
+> deploy. `alembic upgrade head` on a fresh database builds the full current schema from
+> scratch.
+
+### Testing: keep using `create_all()`
+
+In tests, use `SQLModel.metadata.create_all(engine)` on an in-memory SQLite database.
+Migrations are for managing a long-lived production schema; tests throw the database away
+after each run.
+
+---
+
+## 5. Querying
+
+`select()` builds a statement object. Nothing hits the database until `session.exec()`:
+
+```python
+from sqlmodel import select
+
+stmt = select(Note).order_by(Note.id)
+if done is not None:
+    stmt = stmt.where(Note.done == done)
+if search:
+    stmt = stmt.where(Note.title.contains(search))
+stmt = stmt.offset((page - 1) * size).limit(size)
+return list(db.exec(stmt).all())
+```
+
+This is the full `get_all` implementation from `NoteService`. Query parameters `?done=false&search=meeting&page=2` are handled by the router and passed in as typed Python values — FastAPI coerces them automatically.
+
+Common patterns:
+
+```python
+# Filtering
+select(Note).where(Note.done == True)                       # equality
+select(Note).where(Note.title.contains("meeting"))          # LIKE '%meeting%'
+select(Note).where(Note.title.ilike("%meeting%"))           # case-insensitive
+select(Note).where(Note.done == False, Note.title.startswith("Q"))  # AND
+
+from sqlalchemy import or_
+select(Note).where(or_(Note.done == True, Note.title == "urgent"))  # OR
+
+# Ordering
+from sqlalchemy import desc
+select(Note).order_by(desc(Note.title))
+
+# Counting
+from sqlalchemy import func
+session.exec(select(func.count()).select_from(Note)).one()
+```
+
+> **`==` not `is`** — `Note.done is False` is a Python identity check, always wrong in a
+> `.where()`. Use `==`.
+
+| Terminal         | Returns                   | Raises if                 |
+|------------------|---------------------------|---------------------------|
+| `.all()`         | `list` (empty if no rows) | —                         |
+| `.first()`       | first row or `None`       | —                         |
+| `.one()`         | exactly one row           | zero or more than one row |
+| `.one_or_none()` | one row or `None`         | more than one row         |
+
+`db.get(Note, pk)` is a PK shortcut that checks the session cache before hitting the DB.
+
+---
+
+## 6. Error handling
+
+```python
+# app/errors.py
 class NoteNotFoundError(Exception):
     def __init__(self, note_id: int):
         self.note_id = note_id
+```
 
-
+```python
+# app/main.py
 @app.exception_handler(NoteNotFoundError)
 async def note_not_found_handler(request: Request, exc: NoteNotFoundError):
     return JSONResponse(
@@ -86,380 +404,418 @@ async def note_not_found_handler(request: Request, exc: NoteNotFoundError):
     )
 ```
 
-Now your business logic raises a *domain* exception — `raise NoteNotFoundError(note_id)` —
-that knows nothing about HTTP. The handler is the single place that translates it into a
-status code and response shape. The benefits:
-
-- **Uniform error shape** across the whole API, defined once.
-- **Separation of concerns** — your service layer speaks in domain errors, not HTTP codes.
-- **Easy to change** — adjust the response format in one function, not at every raise site.
-
-This is the same reasoning behind Nest's exception filters: keep the "what went wrong"
-(the exception) separate from the "how do we tell the client" (the handler).
+The service raises `NoteNotFoundError` — it knows nothing about HTTP. The handler is the
+single place that picks the status code and response shape. Add more exception types as the
+app grows; map them all in `main.py`.
 
 ---
 
-## 3. Testing: the payoff for dependency injection
+## 7. Testing
 
-This is the most important section. It's where the architecture from Topic 2 proves its
-worth.
+Three test files, each testing at a different level:
 
-### Why FastAPI apps are easy to test
-
-Recall from Topic 1 that Uvicorn (the server) and FastAPI (the app) are separate, and the
-app is just an ASGI callable. That means you can drive the app **in-process, without a
-running server or a real socket** — you construct requests and call the app directly.
-
-`TestClient` does exactly this. It's your Supertest:
-
-```python
-from fastapi.testclient import TestClient
-from app.main import app
-
-client = TestClient(app)
-
-
-def test_create_note():
-    response = client.post("/notes", json={"title": "Write tests"})
-    assert response.status_code == 201
-    assert response.json()["title"] == "Write tests"
+```
+test_notes_router.py    ← full HTTP stack via TestClient
+test_notes_service.py   ← service functions called directly
+test_schemas.py         ← validators with parametrize
 ```
 
-`client.post(...)` synthesizes a full request, runs it through the *entire* real stack —
-routing, validation, dependencies, your handler, serialization — and hands back the
-response. No network, no server startup, milliseconds per test. The test runner is
-**pytest** (your Jest).
-
-### The isolation problem
-
-The test above works, but it writes to your *real* database. That's wrong: tests must be
-isolated and repeatable, not dependent on or mutating real data. In many frameworks this is
-where testing gets painful — you mock the database module, or spin up a real DB and reset
-it between tests.
-
-FastAPI solves it structurally, because of one decision from Topic 2: your handlers get
-their session via `Depends(get_session)` rather than importing it directly.
-
-### Dependency overrides
-
-Every FastAPI app has a `dependency_overrides` dict. It maps *a dependency function* to *a
-replacement*. When FastAPI is about to call `get_session`, it first checks this dict; if
-there's an override, it calls that instead. Your application code is untouched — it still
-asks for `Depends(get_session)` — but in tests that resolves to a different implementation.
+### conftest.py — three fixtures
 
 ```python
-import pytest
-from fastapi.testclient import TestClient
-from sqlmodel import SQLModel, Session, create_engine
-from sqlmodel.pool import StaticPool
-
-from app.main import app
-from app.dependencies import get_session
-
-
-@pytest.fixture(name="client")
-def client_fixture():
-    # A fresh in-memory database, isolated per test
-    engine = create_engine(
-        "sqlite://",                       # in-memory: nothing touches disk
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,              # one shared connection for the test
-    )
+# tests/conftest.py
+def _make_engine():
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
+    return engine
 
+
+@pytest.fixture(name="client")          # fakes auth — use for HTTP contract tests
+def client_fixture():
+    engine = _make_engine()
     def get_session_override():
         with Session(engine) as session:
             yield session
-
-    # The key line: swap the real session dependency for the test one
     app.dependency_overrides[get_session] = get_session_override
-
+    app.dependency_overrides[get_current_user] = lambda: "test-user"
     yield TestClient(app)
+    app.dependency_overrides.clear()
 
-    app.dependency_overrides.clear()       # reset so tests don't leak
+
+@pytest.fixture(name="real_auth_client")  # real JWT — use to test auth itself
+def real_auth_client_fixture():
+    engine = _make_engine()
+    def get_session_override():
+        with Session(engine) as session:
+            yield session
+    app.dependency_overrides[get_session] = get_session_override
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture(name="db")              # raw session — use for direct service tests
+def db_fixture():
+    engine = _make_engine()
+    with Session(engine) as session:
+        yield session
 ```
 
-The mechanism, spelled out:
+### Direct service tests (`test_notes_service.py`)
 
-- The real `get_session` yields a session bound to the production engine.
-- The override yields a session bound to a **throwaway in-memory SQLite** database, created
-  fresh for each test.
-- `app.dependency_overrides[get_session] = get_session_override` tells FastAPI to
-  substitute one for the other during resolution.
-- Every endpoint that does `Depends(get_session)` now transparently gets the test session —
-  **without any change to the application code.**
-
-That is the whole reason Topic 2 insisted on injecting the session rather than importing it.
-Injection is what makes substitution possible. A test using the fixture:
-
-```mermaid
-flowchart LR
-    subgraph handler["Your handler — unchanged"]
-        H["Depends(get_session)"]
-    end
-    H --> R{"override<br/>registered?"}
-    R -->|"production"| P["get_session<br/>→ real DB"]
-    R -->|"under test"| T["get_session_override<br/>→ in-memory DB"]
-
-    style P fill:#2d3a4a,stroke:#5b9bd5,color:#fff
-    style T fill:#2d4a2d,stroke:#4caf50,color:#fff
-```
-
-The handler always asks for the same thing; only what that request *resolves to* changes.
+Call service functions with a real session — no HTTP, no routing, no serialization. Tests
+run in under a millisecond each and test exactly one thing:
 
 ```python
-def test_create_and_read(client):
-    created = client.post("/notes", json={"title": "x"})
-    assert created.status_code == 201
-
-    note_id = created.json()["id"]
-    fetched = client.get(f"/notes/{note_id}")
-    assert fetched.json()["title"] == "x"
+from app.errors import NoteNotFoundError
+from app.schemas import NoteCreate, NoteUpdate
+from app.services.notes import note_service
 
 
-def test_missing_note_404(client):
-    assert client.get("/notes/999").status_code == 404
+def test_create_persists_note(db):
+    note = note_service.create(db, NoteCreate(title="hello"))
+    assert note.id is not None
+    assert note.title == "hello"
+
+
+def test_get_raises_for_missing(db):
+    with pytest.raises(NoteNotFoundError):
+        note_service.get(db, 999)
+
+
+def test_patch_applies_partial_update(db):
+    note = note_service.create(db, NoteCreate(title="original"))
+    patched = note_service.patch(db, note.id, NoteUpdate(done=True))
+    assert patched.title == "original"   # untouched
+    assert patched.done is True
 ```
 
-### pytest fixtures, briefly
+Use this style for business-rule tests. Use `TestClient` for HTTP contract tests (status
+codes, response shapes, auth behaviour).
 
-A `@pytest.fixture` is pytest's dependency injection for *tests* — a function that produces
-a value (and optionally tears it down, again via `yield`). A test that takes a parameter
-named `client` gets the fixture's yielded value. It's the same setup/teardown-around-`yield`
-pattern you've now seen three times: in route dependencies, in the app lifespan, and here in
-test fixtures. Recognizing that shared pattern is worth more than memorizing any one API.
+### `pytest.mark.parametrize` (`test_schemas.py`)
+
+`parametrize` is pytest's `test.each` — one test function, multiple input/output pairs:
+
+```python
+from pydantic import ValidationError
+from app.schemas import NoteCreate, NoteUpdate
+
+
+@pytest.mark.parametrize("title", ["", "   ", "\t", "\n"])
+def test_blank_title_rejected(title):
+    with pytest.raises(ValidationError):
+        NoteCreate(title=title)
+
+
+@pytest.mark.parametrize("title,expected", [
+    ("  hello  ", "hello"),
+    (" leading", "leading"),
+    ("trailing ", "trailing"),
+])
+def test_title_whitespace_stripped(title, expected):
+    note = NoteCreate(title=title)
+    assert note.title == expected
+
+
+def test_update_rejects_unknown_fields():
+    with pytest.raises(ValidationError):
+        NoteUpdate(titl="typo")   # extra="forbid" catches this
+
+
+def test_update_requires_at_least_one_field():
+    with pytest.raises(ValidationError):
+        NoteUpdate()
+
+
+@pytest.mark.parametrize("payload,expected_status", [
+    ({"title": "valid"}, 201),
+    ({"title": ""}, 422),
+    ({"title": "   "}, 422),
+])
+def test_create_endpoint_validation(client, payload, expected_status):
+    assert client.post("/notes", json=payload).status_code == expected_status
+```
+
+Each tuple becomes one named test run in the output. This replaces writing N
+near-identical test functions.
+
+### Mocking with `patch` (`test_notes_router.py`)
+
+When a service calls an external system you don't want that to fire in tests.
+`unittest.mock.patch` replaces a name with a `MagicMock` for the duration of a `with` block.
+
+**The rule: patch where the name is *used*, not where it's *defined*.**
+
+```python
+# services/notes.py does `import httpx` and then calls `httpx.post`
+# so patch it at app.services.notes.httpx.post — not at httpx.post
+
+from unittest.mock import patch
+
+
+def test_create_calls_webhook(client):
+    with patch("app.services.notes.httpx.post") as mock_post:
+        r = client.post("/notes", json={"title": "webhook test"})
+        assert r.status_code == 201
+        # webhook_url is "" in test config so _notify() returns early — not called
+        mock_post.assert_not_called()
+```
+
+To test with a real webhook URL:
+
+```python
+def test_webhook_fires_when_url_set(client, monkeypatch):
+    from app import services
+    monkeypatch.setattr(services.notes.settings, "webhook_url", "http://example.com/hook")
+    with patch("app.services.notes.httpx.post") as mock_post:
+        client.post("/notes", json={"title": "x"})
+        mock_post.assert_called_once()
+        args, kwargs = mock_post.call_args
+        assert args[0] == "http://example.com/hook"
+```
+
+For async functions (common in the real services), use `AsyncMock`:
+
+```python
+from unittest.mock import AsyncMock, patch
+
+async def test_async_service():
+    with patch("app.services.search.client.embed", new_callable=AsyncMock) as mock:
+        mock.return_value = [0.1, 0.2, 0.3]
+        result = await search_service.embed("query")
+        mock.assert_awaited_once_with("query")
+```
+
+### Auth in tests
+
+Override `get_current_user` to skip token validation for tests that aren't testing auth:
+
+```python
+app.dependency_overrides[get_current_user] = lambda: "test-user"
+```
+
+Use `real_auth_client` (no override) when testing the JWT flow itself:
+
+```python
+def test_real_jwt_login_flow(real_auth_client):
+    token = real_auth_client.post("/token").json()["access_token"]
+    r = real_auth_client.get("/notes", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 200
+```
 
 ---
 
-## 4. CORS: the first wall a frontend hits
+## 8. Authentication: JWT as a dependency
 
-The moment a browser-based frontend (React, Vue, plain `fetch`) calls your API from a
-*different origin* — say the app runs on `localhost:5173` and the API on `localhost:8000` —
-the browser enforces **CORS** (Cross-Origin Resource Sharing). If your API doesn't return
-the right headers, the browser blocks the response and the developer sees a console error
-like *"No 'Access-Control-Allow-Origin' header is present."*
-
-This is not a FastAPI-specific problem — it's how browsers work — but it's the first thing
-a JS developer trips on, because a request that works fine from `curl` or `/docs` fails
-from the browser. `curl` doesn't enforce CORS; browsers do.
-
-FastAPI handles it with a **middleware** (yes, FastAPI has middleware too, for
-cross-cutting concerns like this that genuinely wrap every request):
+`OAuth2PasswordBearer` extracts the bearer token and wires up the `/docs` "Authorize"
+button. `get_current_user` decodes it and returns the subject:
 
 ```python
-from fastapi.middleware.cors import CORSMiddleware
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173"],   # the frontend's origin(s)
-    allow_credentials=True,
-    allow_methods=["*"],                        # GET, POST, PUT, DELETE, …
-    allow_headers=["*"],
-)
-```
-
-Key points to understand rather than copy blindly:
-
-- **`allow_origins` is an allowlist of origins, not a wildcard by default.** Listing your
-  actual frontend origins is the correct, secure choice. Read the origins from
-  configuration (section 1) so dev and prod differ by env var, not code.
-- **`allow_origins=["*"]` and `allow_credentials=True` are mutually incompatible** — the
-  browser rejects the combination. If you need cookies/credentials, you must name explicit
-  origins.
-- **Middleware vs. dependencies:** CORS is a legitimate use of middleware because it
-  genuinely wraps *every* request/response to add headers. Contrast with Topic 2's point
-  that per-endpoint *values* belong in dependencies, not middleware. Both mechanisms exist;
-  use middleware for true cross-cutting concerns, dependencies for injected values.
-
----
-
-## 5. Real authentication: `OAuth2PasswordBearer` and JWTs
-
-Topic 2 showed a dependency guarding a route with a static API key, and noted "real apps
-decode a JWT here." Here's what that actually looks like, because it's what you'll reach
-for in week one.
-
-The building block is `OAuth2PasswordBearer` — a dependency that extracts a bearer token
-from the `Authorization: Bearer <token>` header (and wires up the `/docs` "Authorize"
-button for free):
-
-```python
-from typing import Annotated
-from fastapi import Depends, HTTPException
+# app/auth.py
 from fastapi.security import OAuth2PasswordBearer
-import jwt   # from the PyJWT package
+import jwt
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 
-def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]):
+def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]) -> str:
     try:
         payload = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
-    return payload["sub"]        # e.g. the user id encoded in the token
+    return payload["sub"]
+
+
+def create_access_token(subject: str) -> str:
+    return jwt.encode({"sub": subject}, settings.jwt_secret, algorithm="HS256")
 ```
 
-Then any endpoint that needs a logged-in user simply *asks for one*:
+`CurrentUserDep = Annotated[str, Depends(get_current_user)]` in `dependencies.py` makes
+any endpoint require auth with one parameter:
 
 ```python
-@router.get("/notes")
-async def list_notes(current_user: Annotated[str, Depends(get_current_user)]):
-    ...   # current_user is guaranteed valid, or the request already 401'd
+async def list_notes(session: SessionDep, current_user: CurrentUserDep, ...):
 ```
 
-The conceptual point — and why this belongs in a doc about *maintainability* — is that
-**authentication is just another dependency.** It composes with everything from Topic 2:
-
-- It's declared in the signature, so it's explicit which endpoints require auth.
-- It's cached per request, so decoding happens once even if several dependencies need the
-  user.
-- It's **overridable in tests** exactly like the DB session — override `get_current_user`
-  to return a fake user and you can test protected endpoints without minting real tokens.
-
-Login itself (issuing the token) is the mirror image: an endpoint that verifies a
-username/password (hash comparison with `passlib`), then returns a signed JWT via
-`jwt.encode(...)`. The token secret comes from `settings` (section 1), never hardcoded.
-
-> **Scope note:** the crypto details (algorithm choice, token expiry, refresh tokens,
-> password hashing) are a topic of their own. The point here is *structural*: auth in
-> FastAPI is a dependency, so it inherits injection, caching, and testability for free.
+Because `get_current_user` is a dependency it is:
+- **cached per request** — decoded once even if multiple handlers need it
+- **overridable in tests** — `dependency_overrides[get_current_user] = lambda: "test-user"`
+- **explicit** — you can read which endpoints require auth from their signatures
 
 ---
 
-## 6. Containerization: reproducible deployment
+## 9. CORS
 
-Docker packages your app with its exact runtime and dependencies so it runs identically
-everywhere. If you've containerized a Node app, the concepts transfer directly; only the
-commands differ.
+The moment a browser calls your API from a different origin (React on `:5173`, API on
+`:8000`), the browser enforces CORS. `curl` and `/docs` don't — which is why a request
+that works on the command line fails in the browser.
 
-```dockerfile
-FROM python:3.14-slim
-
-WORKDIR /code
-
-# Copy dependency manifest first, install — this layer is cached
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Then copy source. Changing source doesn't invalidate the deps layer above.
-COPY ./app ./app
-
-EXPOSE 8000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```python
+# app/main.py
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,   # from config — never hardcoded
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 ```
 
-Two concepts worth internalizing:
+Two rules: `allow_origins=["*"]` and `allow_credentials=True` are **mutually incompatible**
+— the browser rejects the combination. If you need cookies or credentials, name explicit
+origins. Read them from `settings` so dev and prod differ by env var, not code.
 
-**Layer caching and ordering.** Docker builds in layers and caches each one. It rebuilds a
-layer only if that layer or an earlier one changed. Copying `requirements.txt` and
-installing *before* copying source means that editing your code — the frequent case —
-reuses the cached dependency layer and rebuilds in seconds. This is the identical reasoning
-to `COPY package.json` before `COPY . .` in a Node Dockerfile.
+---
 
-**`--host 0.0.0.0`.** Inside a container, binding to `127.0.0.1` (the default) makes the
-server reachable *only from within the container*. `0.0.0.0` binds all interfaces so the
-mapped port is reachable from the host. This trips up nearly everyone once.
+## 10. Linters, formatters, and pre-commit
 
-### Multi-service with compose
+Both production services enforce code style automatically with three tools: **Black**
+(formatter), **Pylint** (linter), and **pre-commit** (enforcer). Understanding how they
+are configured is useful from day one — you'll see the same `pyproject.toml` sections and
+the same pre-commit hook in every service.
 
-Real apps have more than one process — the API plus a database. `docker-compose.yml`
-declares them together:
+### Black — the formatter
+
+Black reformats Python code to a consistent style with no configuration beyond line length.
+It is opinionated by design: you never argue about formatting, you just run Black.
+
+```toml
+# pyproject.toml
+[tool.black]
+line-length = 120
+target-version = ["py313"]
+```
+
+Both services use `line-length = 120`. Run it:
+
+```bash
+black app/          # reformat in place
+black --check app/  # CI mode: exit 1 if anything would change, don't touch files
+```
+
+Black is a formatter, not a linter — it never rejects code, it only rewrites it.
+
+### Pylint — the linter
+
+Pylint catches real bugs (undefined names, wrong argument counts, unreachable code) and
+style issues that Black doesn't cover (naming conventions, unused imports, complexity).
+
+Both services configure it in `pyproject.toml`:
+
+```toml
+[tool.pylint]
+max-line-length = 120       # match Black
+disable = [
+    "missing-module-docstring",
+    "missing-function-docstring",
+    "fixme",
+]
+good-names = ["i", "j", "k", "ex", "Run", "_", "id", "db"]
+min-similarity-lines = 8    # duplicate-code threshold
+```
+
+Run it:
+
+```bash
+pylint app/                         # full report with scores
+pylint app/ --fail-under=7          # exit 1 if score < 7 (used in CI)
+pylint app/services/notes.py        # single file
+```
+
+Pylint scores are 0–10. The UCM service uses `--fail-under=7` in pre-commit. A score of
+8–9 is realistic for a healthy codebase; 10 is rare and not the goal.
+
+Common messages you'll see:
+
+| Code | Meaning | Usual fix |
+|------|---------|-----------|
+| `C0114` | Missing module docstring | Add a one-line module docstring or disable |
+| `W0611` | Unused import | Remove the import |
+| `R0903` | Too few public methods | Add methods or disable for small data classes |
+| `W0718` | Broad exception catch | Catch a specific exception type |
+| `R0913` | Too many arguments | Extract a parameter object or disable per function |
+
+Disable a single warning inline when the rule genuinely doesn't apply:
+
+```python
+except Exception:  # pylint: disable=broad-except
+    pass
+```
+
+### pre-commit — enforcing both on every commit
+
+`pre-commit` runs hooks automatically before each `git commit`. If a hook fails, the commit
+is blocked. Both services use it to prevent unformatted or lint-failing code from entering
+the repo.
 
 ```yaml
-services:
-  db:
-    image: postgres:16
-    environment:
-      POSTGRES_USER: notes
-      POSTGRES_PASSWORD: notes
-      POSTGRES_DB: notes
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/pre-commit/mirrors-pylint
+    rev: v3.0.0
+    hooks:
+      - id: pylint
+        args: [--fail-under=7]
 
-  api:
-    build: .
-    ports:
-      - "8000:8000"
-    environment:
-      DATABASE_URL: postgresql://notes:notes@db:5432/notes
-    depends_on:
-      - db
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest
+        entry: pytest tests
+        language: system
+        types: [python]
+        pass_filenames: false
+        always_run: true
 ```
 
-Note `@db:5432` in the URL — inside a compose network, services reach each other by
-*service name* as hostname. And note what makes this clean: the API switches from SQLite to
-Postgres purely by setting `DATABASE_URL`, because `Settings` reads that env var (section 1)
-and the engine is built from it (Topic 2). **No application code changes to swap
-databases.** That is the concrete reward for validated config plus injected dependencies —
-the same app runs on SQLite locally and Postgres in production.
+Setup once per clone:
 
----
+```bash
+pip install pre-commit
+pre-commit install        # installs the git hook
+pre-commit run --all-files  # run manually on everything
+```
 
-## 7. The async performance model (a common misconception)
+After `pre-commit install`, every `git commit` runs Pylint and the test suite. A failed
+hook aborts the commit and shows what needs fixing.
 
-Node developers assume `async` means "faster." It does not. `async` is about **concurrency**
-— letting one worker make progress on many requests that are each *waiting* on I/O — not
-about doing any single piece of work faster.
+> **Why this matters:** you will see pre-commit configured in both services. When you clone
+> a repo, run `pre-commit install` immediately — otherwise you can commit code that will
+> fail CI and block your PR.
 
-The mechanics: an `async def` handler runs on the [event loop](./glossary.md#event-loop).
-When it `await`s genuine I/O (an async DB query, an `httpx` call), it yields control so the
-loop can serve other requests while that I/O is in flight. This is efficient for I/O-bound
-workloads.
+### Where to add Black
 
-The trap: if you call a **blocking** function — a synchronous DB driver, `time.sleep`, heavy
-CPU work — inside an `async def`, it does *not* yield. It occupies the event loop and every
-other in-flight request stalls until it returns. This is the single most common FastAPI
-performance bug.
+Black isn't in the current pre-commit config of either service, but adding it is one line:
 
-FastAPI gives you the escape hatch: a handler declared with plain `def` (not `async def`)
-is run in a **thread pool**, so blocking code there doesn't freeze the loop. The practical
-rule:
-
-- Async libraries available → `async def`.
-- Only blocking libraries available → plain `def` (FastAPI threads it for you).
-- Never: a blocking call inside `async def`.
-
-Understanding this prevents both the "why is my async app slow" surprise and the
-over-application of `async` to code that gains nothing from it.
-
----
-
-## 8. Troubleshooting: symptoms JS developers hit first
-
-A lookup table for the errors that most reliably trip up someone arriving from Node. When
-you see the symptom on the left, the cause is on the right.
-
-| Symptom | Likely cause & fix |
-|---------|--------------------|
-| `ModuleNotFoundError: No module named 'app'` | Running from the wrong directory, or a folder is missing its `__init__.py`. Run from the project root and ensure every package folder has an (empty) `__init__.py`. |
-| Browser: *"No 'Access-Control-Allow-Origin' header"* — but `curl`/`/docs` work fine | CORS. The request is cross-origin and the browser blocks it. Add `CORSMiddleware` with your frontend's origin (section 4). `curl` doesn't enforce CORS, which is why it "works." |
-| `422 Unprocessable Entity` you didn't expect | A parameter/body failed **validation** before your code ran. Read the `detail[].loc` — it names the exact field. Often a required field is missing or the wrong type. See [Topic 1](./session-1.md#the-422-error-shape). |
-| Missing required header returns **422**, you wanted **401** | A required `Header()` is validated as part of the request contract *before* your check. Make it `Optional`/`| None` with a default so your code controls the status. See [Topic 2](./session-2.md#dependencies-as-guards-side-effect-only). |
-| The whole server freezes under load / one slow request blocks others | A **blocking** call inside an `async def` — it stalls the event loop. Either use an async library, or make the handler a plain `def` so FastAPI threads it (section 7). |
-| `RuntimeError: ... greenlet_spawn / another operation is in progress` or session errors | Sharing one DB **session** across requests or threads, or using it after commit. Sessions are per-request — get them via `Depends(get_session)`, never a global. |
-| `sqlalchemy ... no such table` | Tables were never created. Ensure `init_db()` runs in the **lifespan** on startup (Topic 2), or that migrations ran. |
-| Response is missing fields you returned, or leaks fields you didn't want | `response_model` is filtering to the declared schema. Add the field to the response model, or (for leaks) that's the feature working — good. See [Topic 1](./session-1.md#5-response_model-validation-on-the-way-out). |
-| `curl` POST gives `422` complaining about the body | You sent form data or forgot `Content-Type: application/json`. A Pydantic-model body expects JSON. Use `-H "Content-Type: application/json" -d '{...}'`. |
-| Config value ignored / app uses the default | The env var name doesn't match the `Settings` field, or `.env` isn't being loaded. Names map case-insensitively (`DATABASE_URL` ← `database_url`); check `env_file` is set (section 1). |
-| Editor shows type errors on `Depends(...)` defaults | Use the `Annotated` form — `x: Annotated[T, Depends(f)]` — which keeps the type honest and satisfies type checkers ([Topic 1](./session-1.md#attaching-metadata-the-annotated-idiom)). |
-| Works in `/docs` but the "Authorize" button does nothing | You're using a custom header check instead of `OAuth2PasswordBearer`; only the latter wires up the docs auth UI (section 5). |
+```yaml
+  - repo: https://github.com/psf/black
+    rev: 25.1.0
+    hooks:
+      - id: black
+        args: [--line-length=120]
+```
 
 ---
 
 ## Key takeaways
 
-1. **`pydantic-settings` validates config at startup** — misconfiguration fails loudly and
-   immediately, and environments differ by env var, not code.
-2. **Centralized exception handlers** map domain errors to HTTP responses in one place,
-   keeping business logic HTTP-agnostic.
-3. **`TestClient` drives the real app in-process** (no server), and **`dependency_overrides`
-   swaps the real DB for a test DB** — the direct payoff of injecting dependencies.
-4. **Docker layer ordering** (deps before source) and **`0.0.0.0` binding** are the two
-   container concepts that matter most; config + injection make DB swaps code-free.
-5. **`async` is concurrency, not speed** — and a blocking call inside `async def` stalls the
-   whole server.
+1. **Routers are thin** — three lines: declare, call service, return. All logic is in
+   `services/`.
+2. **Pydantic validators** (`@field_validator`, `@model_validator`, `extra="forbid"`) enforce
+   business rules at the schema boundary, before data reaches the service.
+3. **Alembic** applies schema changes to existing databases. `create_all()` is dev-only.
+4. **Test at the right level** — `db` fixture for logic, `client` fixture for HTTP
+   contracts, `real_auth_client` for auth behaviour.
+5. **`parametrize`** replaces N near-identical test functions with one.
+6. **Patch where the name is used** (`app.services.notes.httpx.post`), not where it's
+   defined. Use `AsyncMock` for coroutines.
+7. **`pydantic-settings`** validates config at startup — misconfiguration fails loudly
+   rather than mysteriously at request time.
+8. **Run `pre-commit install`** after cloning — Black formats, Pylint lints, tests run
+   automatically before every commit.
 
 ### Concepts to explore further
-- `BackgroundTasks` for work that should happen after the response is sent.
-- Real authentication: JWT decoding in a dependency, password hashing with `passlib`.
-- Alembic migrations and running them as a container startup step.
+- Alembic `--autogenerate` limitations (enum columns, server defaults, naming conventions).
+- `BackgroundTasks` for fire-and-forget work after the response is sent.
+- `mypy` / `pyright` for static type checking beyond what Pylint covers.
 - Multiple Uvicorn workers / Gunicorn for using more than one CPU core.

@@ -5,3 +5,4 @@ class Note(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     title: str
     done: bool = False
+    owner: str | None = None

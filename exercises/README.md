@@ -9,20 +9,23 @@ describe the target behavior** — your job is to make them pass by editing the 
 | [ex1_search_endpoint](./ex1_search_endpoint/) | query params, filtering, `response_model` | [Topic 1](../docs/session-1.md) |
 | [ex4_request_data](./ex4_request_data/) | form fields + file upload (non-JSON request data) | [Topic 1](../docs/session-1.md) |
 | [ex2_owner_dependency](./ex2_owner_dependency/) | a `Depends()` that injects a value | [Topic 2](../docs/session-2.md) |
-| [ex3_health_and_update](./ex3_health_and_update/) | a new route + DB-backed update with tests | [Topic 3](../docs/session-3.md) |
+| [ex3_health_and_update](./ex3_health_and_update/) | a new route + DB-backed PUT with tests | [Topic 2](../docs/session-2.md) |
+| [ex3_service_and_validators](./ex3_service_and_validators/) | service layer, `@field_validator`, `@model_validator`, `extra="forbid"` | [Topic 3](../docs/session-3.md) |
+| [ex5_mocking_parametrize](./ex5_mocking_parametrize/) | `patch()`, `MagicMock`, `monkeypatch`, `@pytest.mark.parametrize` | [Topic 3](../docs/session-3.md) |
 
 ## How to work an exercise
 
-From the `code/` virtual environment (see [code/README.md](../code/README.md) for setup):
+**Always `cd` into the exercise directory before running pytest** — exercises share the
+module name `main.py` and will conflict if run together from the repo root.
 
 ```bash
-cd exercises/ex1_search_endpoint
+cd exercises/ex3_service_and_validators
 pytest -v          # RED: tests fail — read them to learn the spec
-# ...edit the code to satisfy the tests...
+# ...edit main.py to satisfy the tests...
 pytest -v          # GREEN: all pass -> done
 
 # stuck? compare with the finished version:
-cd ../solutions/ex1_search_endpoint && pytest -v
+cd ../solutions/ex3_service_and_validators && pytest -v
 ```
 
 The tests are the specification. Read them first — they tell you exactly what to build.

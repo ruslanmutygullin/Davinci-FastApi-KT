@@ -1,10 +1,9 @@
-"""Test setup for Topic 3.
+"""Shared test fixtures for Topic 3.
 
-We override TWO dependencies:
-- get_session       -> in-memory test database (as in Topic 2)
-- get_current_user  -> a fake user, so we can test protected routes without minting tokens
-
-This is the payoff of auth-as-a-dependency: authentication becomes trivially fakeable.
+Three fixtures:
+- `client`          — TestClient with auth faked; use for endpoint integration tests
+- `real_auth_client`— TestClient with real JWT flow; use to test auth itself
+- `db`              — raw Session for direct service tests (no HTTP)
 """
 
 import pytest
@@ -45,7 +44,7 @@ def client_fixture():
 
 @pytest.fixture(name="real_auth_client")
 def real_auth_client_fixture():
-    """Like `client`, but WITHOUT faking auth — used to test the real token flow."""
+    """Like `client`, but WITHOUT faking auth — used to test the real JWT flow."""
     engine = _make_engine()
 
     def get_session_override():
@@ -57,3 +56,11 @@ def real_auth_client_fixture():
     yield TestClient(app)
 
     app.dependency_overrides.clear()
+
+
+@pytest.fixture(name="db")
+def db_fixture():
+    """A raw Session for calling service functions directly — no HTTP overhead."""
+    engine = _make_engine()
+    with Session(engine) as session:
+        yield session

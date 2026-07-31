@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     jwt_secret: str = "change-me-in-production-this-is-only-a-demo-secret"
     # Comma-separated origins in the env become a list; default allows a common dev port.
     cors_origins: list[str] = ["http://localhost:5173"]
+    webhook_url: str = ""
 
     model_config = SettingsConfigDict(env_file=".env")
 
