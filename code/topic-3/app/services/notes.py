@@ -24,13 +24,13 @@ def _notify(note: Note) -> None:
         return
     try:
         httpx.post(settings.webhook_url, json={"id": note.id, "title": note.title}, timeout=5)
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
 
 
 class NoteService:
+    @staticmethod
     def get_all(
-        self,
         db: Session,
         *,
         done: bool | None = None,
@@ -38,21 +38,23 @@ class NoteService:
         page: int = 1,
         size: int = 20,
     ) -> list[Note]:
-        stmt = select(Note).order_by(Note.id)
+        stmt = select(Note).order_by(Note.id)  # type: ignore[arg-type]
         if done is not None:
             stmt = stmt.where(Note.done == done)
         if search:
-            stmt = stmt.where(Note.title.contains(search))
+            stmt = stmt.where(Note.title.contains(search))  # type: ignore[attr-defined]
         stmt = stmt.offset((page - 1) * size).limit(size)
-        return list(db.exec(stmt).all())
+        return list(db.exec(stmt).all())  # type: ignore[arg-type]
 
-    def get(self, db: Session, note_id: int) -> Note:
-        note = db.get(Note, note_id)
+    @staticmethod
+    def get(db: Session, note_id: int) -> Note:
+        note: Note | None = db.get(Note, note_id)  # type: ignore[assignment]
         if not note:
             raise NoteNotFoundError(note_id)
         return note
 
-    def create(self, db: Session, payload: NoteCreate) -> Note:
+    @staticmethod
+    def create(db: Session, payload: NoteCreate) -> Note:
         note = Note(title=payload.title, done=payload.done)
         db.add(note)
         db.commit()

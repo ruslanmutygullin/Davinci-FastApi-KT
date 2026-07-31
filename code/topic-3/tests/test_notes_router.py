@@ -65,7 +65,9 @@ def test_protected_route_rejects_bad_token(real_auth_client):
 
 
 def test_real_jwt_login_flow(real_auth_client):
-    token = real_auth_client.post("/token").json()["access_token"]
+    token = real_auth_client.post(
+        "/token", data={"username": "demo-user", "password": "any"}
+    ).json()["access_token"]
     r = real_auth_client.get("/notes", headers={"Authorization": f"Bearer {token}"})
     assert r.status_code == 200
 

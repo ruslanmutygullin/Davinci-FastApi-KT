@@ -4,9 +4,8 @@ Each handler does three things only: declare what it needs (deps + params),
 call the service, return the result. No business logic lives here.
 """
 
-from typing import Annotated
-
 from fastapi import APIRouter, Depends
+from fastapi.security import OAuth2PasswordRequestForm
 
 from app.auth import create_access_token
 from app.dependencies import CurrentUserDep, SessionDep, require_api_key
@@ -17,12 +16,13 @@ router = APIRouter(tags=["notes"])
 
 
 @router.post("/token")
-async def login():
-    """Stand-in login — returns a JWT for the demo user.
+async def login(form: OAuth2PasswordRequestForm = Depends()):
+    """Stand-in login — any username/password works, returns a JWT for the demo user.
 
-    A real login would verify a username/password first.
+    In /docs: click Authorize, enter any username and password, submit.
+    A real login would verify credentials against the database first.
     """
-    return {"access_token": create_access_token("demo-user"), "token_type": "bearer"}
+    return {"access_token": create_access_token(form.username), "token_type": "bearer"}
 
 
 @router.get("/notes", response_model=list[NoteRead])

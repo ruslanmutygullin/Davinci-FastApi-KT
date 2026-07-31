@@ -16,7 +16,7 @@ from app.routers import notes
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_app: FastAPI):
     init_db()
     yield
 
@@ -36,7 +36,7 @@ app.include_router(notes.router)
 
 
 @app.exception_handler(NoteNotFoundError)
-async def note_not_found_handler(request: Request, exc: NoteNotFoundError):
+async def note_not_found_handler(_request: Request, exc: NoteNotFoundError):
     # One place that turns a domain error into an HTTP response.
     return JSONResponse(
         status_code=404,
