@@ -9,10 +9,10 @@ New vs Topic 2:
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Header
-from sqlmodel import Session, select
+from sqlmodel import select
 
-from app.auth import create_access_token, get_current_user
-from app.database import get_session
+from app.auth import create_access_token
+from app.dependencies import SessionDep, CurrentUserDep
 from app.errors import NoteNotFoundError
 from app.models import Note
 from app.schemas import NoteCreate, NoteRead
@@ -36,19 +36,12 @@ async def login():
 
 
 @router.get("/notes", response_model=list[NoteRead])
-async def list_notes(
-    session: Annotated[Session, Depends(get_session)],
-    current_user: Annotated[str, Depends(get_current_user)],
-):
+async def list_notes(session: SessionDep, current_user: CurrentUserDep):
     return session.exec(select(Note)).all()
 
 
 @router.post("/notes", response_model=NoteRead, status_code=201)
-async def create_note(
-    payload: NoteCreate,
-    session: Annotated[Session, Depends(get_session)],
-    current_user: Annotated[str, Depends(get_current_user)],
-):
+async def create_note(payload: NoteCreate, session: SessionDep, current_user: CurrentUserDep):
     note = Note(title=payload.title, done=payload.done)
     session.add(note)
     session.commit()
@@ -57,11 +50,7 @@ async def create_note(
 
 
 @router.get("/notes/{note_id}", response_model=NoteRead)
-async def get_note(
-    note_id: int,
-    session: Annotated[Session, Depends(get_session)],
-    current_user: Annotated[str, Depends(get_current_user)],
-):
+async def get_note(note_id: int, session: SessionDep, current_user: CurrentUserDep):
     note = session.get(Note, note_id)
     if not note:
         raise NoteNotFoundError(note_id)  # handled centrally in main.py
@@ -69,7 +58,7 @@ async def get_note(
 
 
 @router.delete("/notes/{note_id}", status_code=204, dependencies=[Depends(require_api_key)])
-async def delete_note(note_id: int, session: Annotated[Session, Depends(get_session)]):
+async def delete_note(note_id: int, session: SessionDep):
     note = session.get(Note, note_id)
     if not note:
         raise NoteNotFoundError(note_id)

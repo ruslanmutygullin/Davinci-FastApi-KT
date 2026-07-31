@@ -13,7 +13,7 @@ from sqlmodel import SQLModel, Session, create_engine
 from sqlmodel.pool import StaticPool
 
 from app.main import app
-from app.database import get_session
+from app.dependencies import get_session
 from app.auth import get_current_user
 
 
