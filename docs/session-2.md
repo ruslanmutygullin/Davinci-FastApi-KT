@@ -388,7 +388,7 @@ from sqlmodel import SQLModel, Session, create_engine
 from sqlmodel.pool import StaticPool
 
 from app.main import app
-from app.database import get_session
+from app.dependencies import get_session
 
 
 @pytest.fixture(name="client")
@@ -464,47 +464,6 @@ Because these are separate, you can add a column to the table, change how data i
 or add an internal field **without changing what clients send or receive**. The API
 contract and the storage schema evolve independently. This is the structural reason FastAPI
 apps stay maintainable as they grow, and it's why `response_model` (Topic 1) matters.
-
-### A fourth schema: `NoteUpdate` for partial updates (PATCH)
-
-`NoteCreate` doubles as the PUT body, which models a *full replacement* — the client must
-send every field. But often you want to change one field and leave the rest alone. That's
-`PATCH`, and it needs its own schema where **every field is optional**:
-
-```python
-class NoteUpdate(SQLModel):
-    title: str | None = None
-    done: bool | None = None
-```
-
-The handler then applies only the fields the client actually sent, using
-`exclude_unset=True` to tell the difference between "field omitted" and "field explicitly
-set to null":
-
-```python
-@router.patch("/{note_id}", response_model=NoteRead)
-async def patch_note(
-    note_id: int,
-    payload: NoteUpdate,
-    session: Annotated[Session, Depends(get_session)],
-):
-    note = session.get(Note, note_id)
-    if not note:
-        raise HTTPException(status_code=404, detail="Note not found")
-    # Only overwrite the fields the client sent.
-    updates = payload.model_dump(exclude_unset=True)
-    for key, value in updates.items():
-        setattr(note, key, value)
-    session.add(note)
-    session.commit()
-    session.refresh(note)
-    return note
-```
-
-`exclude_unset=True` is the crux: without it, the omitted fields come back as their
-defaults (`None`) and you'd wipe data the client never meant to touch. This is a fourth
-distinct shape — create, read, full-replace, partial-update — and it's exactly why keeping
-schemas separate from the table model pays off.
 
 ---
 

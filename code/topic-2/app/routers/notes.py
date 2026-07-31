@@ -7,9 +7,9 @@ database with app.dependency_overrides (see tests/conftest.py) — the whole rea
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Header
-from sqlmodel import Session, select
+from sqlmodel import select
 
-from app.database import get_session
+from app.dependencies import SessionDep
 from app.models import Note
 from app.schemas import NoteCreate, NoteRead, NoteUpdate
 
@@ -29,14 +29,14 @@ def require_api_key(x_api_key: Annotated[str | None, Header()] = None):
 
 
 @router.get("", response_model=list[NoteRead])
-async def list_notes(session: Annotated[Session, Depends(get_session)]):
+async def list_notes(session: SessionDep):
     return session.exec(select(Note)).all()
 
 
 @router.post("", response_model=NoteRead, status_code=201)
 async def create_note(
     payload: NoteCreate,
-    session: Annotated[Session, Depends(get_session)],
+    session: SessionDep,
 ):
     note = Note(title=payload.title, done=payload.done)
     session.add(note)
@@ -46,7 +46,7 @@ async def create_note(
 
 
 @router.get("/{note_id}", response_model=NoteRead)
-async def get_note(note_id: int, session: Annotated[Session, Depends(get_session)]):
+async def get_note(note_id: int, session: SessionDep):
     note = session.get(Note, note_id)
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
@@ -57,7 +57,7 @@ async def get_note(note_id: int, session: Annotated[Session, Depends(get_session
 async def update_note(
     note_id: int,
     payload: NoteCreate,
-    session: Annotated[Session, Depends(get_session)],
+    session: SessionDep,
 ):
     note = session.get(Note, note_id)
     if not note:
@@ -74,7 +74,7 @@ async def update_note(
 async def patch_note(
     note_id: int,
     payload: NoteUpdate,
-    session: Annotated[Session, Depends(get_session)],
+    session: SessionDep,
 ):
     """Partial update: apply only the fields the client actually sent.
 
@@ -94,7 +94,7 @@ async def patch_note(
 
 
 @router.delete("/{note_id}", status_code=204, dependencies=[Depends(require_api_key)])
-async def delete_note(note_id: int, session: Annotated[Session, Depends(get_session)]):
+async def delete_note(note_id: int, session: SessionDep):
     note = session.get(Note, note_id)
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
