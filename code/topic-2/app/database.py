@@ -1,6 +1,6 @@
-"""Database wiring: the engine (one per app) and the per-request session dependency."""
+"""Database wiring: the engine (one per app). Session dependency lives in dependencies.py."""
 
-cfrom sqlmodel import SQLModel, create_engine
+from sqlmodel import SQLModel, create_engine
 
 # A local SQLite file — zero setup. Swap this URL for Postgres and nothing else changes.
 DATABASE_URL = "sqlite:///./notes.db"
