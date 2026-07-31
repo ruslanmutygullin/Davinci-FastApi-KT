@@ -6,24 +6,16 @@ New vs Topic 2:
 - a /token login route issues a JWT so you can try the protected routes.
 """
 
-from typing import Annotated
-
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends
 from sqlmodel import select
 
 from app.auth import create_access_token
-from app.dependencies import SessionDep, CurrentUserDep
+from app.dependencies import SessionDep, CurrentUserDep, require_api_key
 from app.errors import NoteNotFoundError
 from app.models import Note
 from app.schemas import NoteCreate, NoteRead
 
 router = APIRouter(tags=["notes"])
-
-
-def require_api_key(x_api_key: Annotated[str | None, Header()] = None):
-    if x_api_key != "secret123":
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return x_api_key
 
 
 @router.post("/token")

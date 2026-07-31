@@ -4,6 +4,8 @@
 genuine JWT flow (login -> use token).
 """
 
+from app.config import settings
+
 
 def test_create_and_read_with_fake_auth(client):
     created = client.post("/notes", json={"title": "prod-ready"})
@@ -26,7 +28,7 @@ def test_delete_requires_api_key(client):
     nid = client.post("/notes", json={"title": "x"}).json()["id"]
     assert client.delete(f"/notes/{nid}").status_code == 401
     assert (
-        client.delete(f"/notes/{nid}", headers={"x-api-key": "secret123"}).status_code
+        client.delete(f"/notes/{nid}", headers={"x-api-key": settings.api_key}).status_code
         == 204
     )
 

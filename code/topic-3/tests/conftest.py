@@ -17,14 +17,19 @@ from app.dependencies import get_session
 from app.auth import get_current_user
 
 
-@pytest.fixture(name="client")
-def client_fixture():
+def _make_engine():
     engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
     SQLModel.metadata.create_all(engine)
+    return engine
+
+
+@pytest.fixture(name="client")
+def client_fixture():
+    engine = _make_engine()
 
     def get_session_override():
         with Session(engine) as session:
@@ -41,12 +46,7 @@ def client_fixture():
 @pytest.fixture(name="real_auth_client")
 def real_auth_client_fixture():
     """Like `client`, but WITHOUT faking auth — used to test the real token flow."""
-    engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    SQLModel.metadata.create_all(engine)
+    engine = _make_engine()
 
     def get_session_override():
         with Session(engine) as session:
